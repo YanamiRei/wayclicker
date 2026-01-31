@@ -160,15 +160,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut device = device.unwrap();
         
         // Grab the device to prevent events from going to other applications?
-        // CAUTION: Grabbing prevents other apps from seeing the key. 
-        // For a toggle key, we usually WANT to grab it if it's a dedicated macro key,
-        // but if it's "F6", grabbing it means F6 never reaches the OS.
-        // For now, we keep the grab behavior as requested in the original, but be aware of this.
+        // CAUTION: Grabbing prevents other apps from seeing the key.
+        // We removed the grab so you can still use your keyboard while this runs.
+        /*
         if let Err(e) = device.grab() {
             eprintln!("Failed to grab input device: {}. Ensure you run with sufficient permissions (e.g., `sudo`).", e);
             return;
         }
         println!("Grabbed input device: {}", device.name().unwrap_or("unnamed"));
+        */
+        println!("Monitoring input device: {}", device.name().unwrap_or("unnamed"));
 
         loop {
             if let Ok(events) = device.fetch_events() {
