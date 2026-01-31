@@ -1,6 +1,6 @@
 use clap::Parser;
 use evdev::{
-    uinput::VirtualDeviceBuilder, AttributeSet, EventType, InputEvent, KeyCode,
+    uinput::VirtualDevice, AttributeSet, EventType, InputEvent, KeyCode,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     keys.insert(KeyCode::BTN_RIGHT);
     keys.insert(KeyCode::BTN_MIDDLE);
 
-    let virtual_device = VirtualDeviceBuilder::new()?
+    let virtual_device = VirtualDevice::builder()?
         .name("Wayclicker Virtual Mouse")
         .with_keys(&keys)?
         .build()
@@ -173,8 +173,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             if let Ok(events) = device.fetch_events() {
                  for event in events {
-                    if let evdev::InputEventKind::Key(key) = event.kind() {
-                        if event.value() == 1 && key == toggle_key {
+                    if let evdev::EventSummary::Key(_, key, value) = event.destructure() {
+                        if value == 1 && key == toggle_key {
                             let mut enabled = clicking_enabled_clone.lock().unwrap();
                             *enabled = !*enabled; // Toggle the state
                             println!("Autoclicker toggled: {}", if *enabled { "ON" } else { "OFF" });
@@ -196,8 +196,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut v_dev = virtual_device_clone.lock().unwrap();
 
             // Press
-            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY, mouse_button_code.0, 1)]);
-            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY.0, mouse_button_code.0, 1)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0)]);
             
             // Release lock during sleep? No, actually we can release it, but we need it again very soon.
             // Better to drop the lock before sleeping.
@@ -207,8 +207,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut v_dev = virtual_device_clone.lock().unwrap();
             // Release
-            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY, mouse_button_code.0, 0)]);
-            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY.0, mouse_button_code.0, 0)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0)]);
             drop(v_dev);
 
             thread::sleep(click_interval.checked_sub(Duration::from_millis(10)).unwrap_or_default());
