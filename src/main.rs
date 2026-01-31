@@ -1,22 +1,15 @@
 use clap::Parser;
+use evdev::{
+    uinput::VirtualDeviceBuilder, AttributeSet, EventType, InputEvent, KeyCode,
+};
 use std::{
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
-use wayland_client::{
-    protocol::{wl_pointer, wl_registry},
-    Connection, Dispatch, QueueHandle,
-    Proxy, // Required for .interface()
-};
-// Corrected import path for virtual pointer
-use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
-    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
-};
-use evdev::KeyCode;
 
-/// A powerful and fast autoclicker for Wayland.
+/// A powerful, universal autoclicker for Linux (Wayland & X11).
+/// Works on GNOME, KDE, Hyprland, and others by using kernel-level uinput.
 #[derive(Parser, Debug)]
 #[command(author = "Dacraezy1", version, about, long_about = None)]
 struct Args {
@@ -31,63 +24,6 @@ struct Args {
     /// Mouse button to click (left, right, middle)
     #[arg(short, long, default_value = "left")]
     button: String,
-}
-
-// AppState will hold our Wayland objects and the virtual pointer manager
-struct AppState {
-    virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
-}
-
-impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _data: &(),
-        _conn: &Connection,
-        qhandle: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            // Bind to the virtual pointer manager if available
-            if interface == ZwlrVirtualPointerManagerV1::interface().name {
-                println!("Found virtual pointer manager (version {})", version);
-                state.virtual_pointer_manager = Some(
-                    registry.bind::<ZwlrVirtualPointerManagerV1, _, _>(name, version, qhandle, ()),
-                );
-            }
-        }
-    }
-}
-
-// Dispatch for ZwlrVirtualPointerManagerV1
-impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for AppState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &ZwlrVirtualPointerManagerV1,
-        _event: <ZwlrVirtualPointerManagerV1 as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-// Dispatch for ZwlrVirtualPointerV1
-impl Dispatch<ZwlrVirtualPointerV1, ()> for AppState {
-    fn event(
-        _state: &mut Self,
-        _proxy: &ZwlrVirtualPointerV1,
-        _event: <ZwlrVirtualPointerV1 as wayland_client::Proxy>::Event,
-        _data: &(),
-        _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
-    ) {
-    }
 }
 
 // Function to parse the toggle key string into an evdev::KeyCode
@@ -131,19 +67,30 @@ fn parse_toggle_key(key_str: &str) -> Option<KeyCode> {
         "H" => Some(KeyCode::KEY_H),
         "G" => Some(KeyCode::KEY_G),
         "F" => Some(KeyCode::KEY_F),
+        "ESC" => Some(KeyCode::KEY_ESC),
+        "TAB" => Some(KeyCode::KEY_TAB),
+        "CAPSLOCK" => Some(KeyCode::KEY_CAPSLOCK),
+        "LEFTSHIFT" | "SHIFT" => Some(KeyCode::KEY_LEFTSHIFT),
+        "LEFTCTRL" | "CTRL" => Some(KeyCode::KEY_LEFTCTRL),
+        "LEFTALT" | "ALT" => Some(KeyCode::KEY_LEFTALT),
+        "SPACE" => Some(KeyCode::KEY_SPACE),
+        "ENTER" => Some(KeyCode::KEY_ENTER),
+        "BACKSPACE" => Some(KeyCode::KEY_BACKSPACE),
         "BTN_LEFT" => Some(KeyCode::BTN_LEFT),
         "BTN_RIGHT" => Some(KeyCode::BTN_RIGHT),
         "BTN_MIDDLE" => Some(KeyCode::BTN_MIDDLE),
+        "BTN_SIDE" => Some(KeyCode::BTN_SIDE),
+        "BTN_EXTRA" => Some(KeyCode::BTN_EXTRA),
         _ => None,
     }
 }
 
-// Function to parse the mouse button string into a linux button code
-fn parse_mouse_button(button_str: &str) -> Option<u32> {
+// Function to parse the mouse button string into a KeyCode for the virtual mouse
+fn parse_mouse_button(button_str: &str) -> Option<KeyCode> {
     match button_str.to_lowercase().as_str() {
-        "left" => Some(0x110),   // BTN_LEFT
-        "right" => Some(0x111),  // BTN_RIGHT
-        "middle" => Some(0x112), // BTN_MIDDLE
+        "left" => Some(KeyCode::BTN_LEFT),
+        "right" => Some(KeyCode::BTN_RIGHT),
+        "middle" => Some(KeyCode::BTN_MIDDLE),
         _ => None,
     }
 }
@@ -154,44 +101,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let toggle_key = parse_toggle_key(&args.toggle_key)
         .ok_or_else(|| format!("Invalid toggle key: {}", args.toggle_key))?;
 
-    let mouse_button = parse_mouse_button(&args.button)
+    let mouse_button_code = parse_mouse_button(&args.button)
         .ok_or_else(|| format!("Invalid mouse button: {}. Use 'left', 'right', or 'middle'.", args.button))?;
 
     println!(
-        "Autoclicker configured: Interval = {}ms, Toggle Key = {}, Mouse Button = {}",
+        "Wayclicker configured: Interval = {}ms, Toggle Key = {}, Mouse Button = {}",
         args.interval, args.toggle_key, args.button
     );
     println!("To start/stop clicking, press the '{}' key.", args.toggle_key);
-    println!("NOTE: This program needs to be run with permissions to read input devices (e.g., `sudo`).");
+    println!("NOTE: This program needs to be run with root permissions (sudo) to create a virtual input device.");
 
     // Shared state for toggling the autoclicker
     let clicking_enabled = Arc::new(Mutex::new(false));
     let clicking_enabled_clone = Arc::clone(&clicking_enabled);
+
+    // --- Virtual Device Creation (uinput) ---
+    // We create a virtual mouse that can emit key events (buttons) and synchronization events.
+    let mut keys = AttributeSet::<KeyCode>::new();
+    keys.insert(KeyCode::BTN_LEFT);
+    keys.insert(KeyCode::BTN_RIGHT);
+    keys.insert(KeyCode::BTN_MIDDLE);
+
+    let virtual_device = VirtualDeviceBuilder::new()?
+        .name("Wayclicker Virtual Mouse")
+        .with_keys(&keys)?
+        .build()
+        .map_err(|e| format!("Failed to create virtual device: {}. (Did you run with sudo?)", e))?;
+
+    let mut virtual_device = Arc::new(Mutex::new(virtual_device));
+    let virtual_device_clone = Arc::clone(&virtual_device);
 
     // --- Keyboard Listener Thread ---
     thread::spawn(move || {
         let mut device = None;
         // Try to find a keyboard device
         for (_, d) in evdev::enumerate() {
-            if d.supported_events().contains(evdev::EventType::KEY) {
+            if d.supported_events().contains(EventType::KEY) {
                 // Heuristic: try to find a keyboard.
-                if d.name().unwrap_or("").to_lowercase().contains("keyboard") || d.name().unwrap_or("").to_lowercase().contains("kbd") {
-                    println!("Found input device: {}", d.name().unwrap_or("unnamed"));
-                    device = Some(d);
-                    break;
+                if d.name().unwrap_or("").to_lowercase().contains("keyboard")
+                    || d.name().unwrap_or("").to_lowercase().contains("kbd")
+                {
+                    // Basic filter to avoid grabbing our own virtual device or other non-keyboards
+                    if !d.name().unwrap_or("").contains("Wayclicker") {
+                         println!("Found input device: {}", d.name().unwrap_or("unnamed"));
+                         device = Some(d);
+                         break;
+                    }
                 }
             }
         }
 
         if device.is_none() {
-            eprintln!("No keyboard device found via heuristics.");
+            eprintln!("No physical keyboard device found via heuristics.");
             eprintln!("Warning: Auto-detection failed. Monitoring disabled.");
             return;
         }
 
         let mut device = device.unwrap();
         
-        // Grab the device to prevent events from going to other applications
+        // Grab the device to prevent events from going to other applications?
+        // CAUTION: Grabbing prevents other apps from seeing the key. 
+        // For a toggle key, we usually WANT to grab it if it's a dedicated macro key,
+        // but if it's "F6", grabbing it means F6 never reaches the OS.
+        // For now, we keep the grab behavior as requested in the original, but be aware of this.
         if let Err(e) = device.grab() {
             eprintln!("Failed to grab input device: {}. Ensure you run with sufficient permissions (e.g., `sudo`).", e);
             return;
@@ -201,8 +173,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             if let Ok(events) = device.fetch_events() {
                  for event in events {
-                    if let evdev::EventSummary::Key(_, key, value) = event.destructure() {
-                        if value == 1 && key == toggle_key {
+                    if let evdev::InputEventKind::Key(key) = event.kind() {
+                        if event.value() == 1 && key == toggle_key {
                             let mut enabled = clicking_enabled_clone.lock().unwrap();
                             *enabled = !*enabled; // Toggle the state
                             println!("Autoclicker toggled: {}", if *enabled { "ON" } else { "OFF" });
@@ -213,55 +185,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- Wayland Connection and Clicking Logic (Main Thread) ---
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => {
-             eprintln!("Failed to connect to Wayland display: {}", e);
-             return Err(Box::new(e));
-        }
-    };
-
-    let mut event_queue = conn.new_event_queue();
-    let qhandle = event_queue.handle();
-
-    let display = conn.display();
-    display.get_registry(&qhandle, ());
-
-    let mut app_state = AppState {
-        virtual_pointer_manager: None,
-    };
-
-    // Process events to get the virtual pointer manager
-    event_queue.roundtrip(&mut app_state)?;
-
-    let virtual_pointer_manager = app_state
-        .virtual_pointer_manager
-        .expect("Compositor does not support zwlr_virtual_pointer_manager_v1. Are you running a wlroots compositor (Sway, Hyprland)?");
-
-    // Create the virtual pointer
-    // Takes 3 arguments in 0.31: (seat, qhandle, udata)
-    let virtual_pointer = virtual_pointer_manager.create_virtual_pointer(None, &qhandle, ());
-
-    println!("Virtual pointer created. Autoclicker ready.");
-
+    // --- Clicking Loop (Main Thread) ---
     let click_interval = Duration::from_millis(args.interval);
 
     loop {
         let enabled = *clicking_enabled.lock().unwrap();
 
         if enabled {
-            // Send button press
-            virtual_pointer.button(0, mouse_button, wl_pointer::ButtonState::Pressed);
-            virtual_pointer.frame(); // Commit the event
-            conn.flush()?;
+            // We must lock the device to write to it
+            let mut v_dev = virtual_device_clone.lock().unwrap();
+
+            // Press
+            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY, mouse_button_code.0, 1)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
+            
+            // Release lock during sleep? No, actually we can release it, but we need it again very soon.
+            // Better to drop the lock before sleeping.
+            drop(v_dev);
 
             thread::sleep(Duration::from_millis(10)); // Small delay for button down state
 
-            // Send button release
-            virtual_pointer.button(0, mouse_button, wl_pointer::ButtonState::Released);
-            virtual_pointer.frame(); // Commit the event
-            conn.flush()?;
+            let mut v_dev = virtual_device_clone.lock().unwrap();
+            // Release
+            let _ = v_dev.emit(&[InputEvent::new(EventType::KEY, mouse_button_code.0, 0)]);
+            let _ = v_dev.emit(&[InputEvent::new(EventType::SYNCHRONIZATION, 0, 0)]);
+            drop(v_dev);
 
             thread::sleep(click_interval.checked_sub(Duration::from_millis(10)).unwrap_or_default());
         } else {
